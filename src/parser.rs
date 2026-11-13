@@ -21,7 +21,8 @@ pub struct Parser<'a> {
     pub limits: Limits,
     pub steps: u64,
     pub step_limit: u64,
-    started: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+    clock_ticks: u8,
     pub aborted: bool,
     pub live_after: usize,
     pub live_st_after: usize,
@@ -38,23 +39,56 @@ pub struct ReduceAction {
 }
 
 impl<'a> Parser<'a> {
+    pub fn try_new(lang: &'a Language, input: &'a [u8], limits: Limits) -> Option<Self> {
+        let scanner = if lang.external_token_count > 0 {
+            Some(crate::scanner::create(&lang.name)?)
+        } else {
+            None
+        };
+        Some(Self::with_scanner(lang, input, limits, scanner, false))
+    }
+
     pub fn new(lang: &'a Language, input: &'a [u8], limits: Limits) -> Self {
-        // 预留容量只占虚拟地址，页面写到才算常驻内存；避免向量翻倍扩容时新旧两份同时在内存里。
-        let guess = (input.len() / 2 + 1024).min(limits.max_nodes);
-        let mut a = Arena::default();
-        a.nodes.reserve_exact(guess);
-        a.kids.reserve_exact(guess);
         let scanner = if lang.external_token_count > 0 {
             crate::scanner::create(&lang.name)
         } else {
             None
         };
         let no_scanner = lang.external_token_count > 0 && scanner.is_none();
+        Self::with_scanner(lang, input, limits, scanner, no_scanner)
+    }
+
+    fn with_scanner(
+        lang: &'a Language,
+        input: &'a [u8],
+        limits: Limits,
+        scanner: Option<Box<dyn Scanner>>,
+        no_scanner: bool,
+    ) -> Self {
+        let pre_abort = no_scanner
+            || limits.max_nodes == 0
+            || limits.max_versions == 0
+            || input.len() >= u32::MAX as usize / 2;
+        let mut a = Arena::default();
+        if !pre_abort {
+            // 适度预留容量，避免超大输入或短预算请求在进入主循环前分配过多内存。
+            let guess = (input.len() / 8 + 64).min(limits.max_nodes).min(32_768);
+            a.nodes.reserve_exact(guess);
+            a.kids.reserve_exact(guess);
+        }
+        let deadline = if limits.max_millis > 0 {
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(limits.max_millis))
+        } else {
+            None
+        };
+        let mut lexer = Lexer::new(input);
+        lexer.set_deadline(deadline);
         Parser {
             lang,
             a,
             st: Stack::new(),
-            lexer: Lexer::new(input),
+            lexer,
             finished: NONE,
             accept_count: 0,
             limits,
@@ -62,10 +96,13 @@ impl<'a> Parser<'a> {
             step_limit: if limits.max_steps > 0 {
                 limits.max_steps
             } else {
-                200_000 + 400 * input.len() as u64
+                (input.len() as u64)
+                    .saturating_mul(400)
+                    .saturating_add(200_000)
             },
-            started: std::time::Instant::now(),
-            aborted: no_scanner,
+            deadline,
+            clock_ticks: 0,
+            aborted: pre_abort,
             live_after: 0,
             live_st_after: 0,
             scanner,
@@ -74,19 +111,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 立即核对协作式时间预算（仅用于低频检查点）。
+    #[inline]
+    pub fn check_timeout_now(&mut self) -> bool {
+        if self.lexer.timed_out {
+            self.aborted = true;
+            return true;
+        }
+        if let Some(dl) = self.deadline
+            && std::time::Instant::now() >= dl
+        {
+            self.lexer.timed_out = true;
+            self.aborted = true;
+            return true;
+        }
+        false
+    }
+
     /// 超出任何一项资源上限就标记中止。
     pub fn over_budget(&mut self) -> bool {
-        if self.steps > self.step_limit
+        if self.lexer.timed_out
+            || self.steps > self.step_limit
             || self.a.nodes.len() > self.limits.max_nodes
+            || self.a.kids.len() > self.limits.max_nodes.saturating_mul(8)
             || self.st.nodes.len() > self.limits.max_nodes.saturating_mul(2)
             || self.a.ext_total > (64 << 20)
         {
             self.aborted = true;
         }
-        if self.limits.max_millis > 0
-            && self.steps.is_multiple_of(256)
-            && self.started.elapsed().as_millis() as u64 > self.limits.max_millis
+        self.clock_ticks = self.clock_ticks.wrapping_add(1);
+        if self.clock_ticks == 0
+            && let Some(dl) = self.deadline
+            && std::time::Instant::now() >= dl
         {
+            self.lexer.timed_out = true;
             self.aborted = true;
         }
         self.aborted
@@ -118,6 +176,10 @@ impl<'a> Parser<'a> {
                 let mut found = sc.scan(&mut sl, lang.ext_valid_row(ext));
                 let res = sl.result as usize;
                 self.lexer.finish();
+                if self.lexer.timed_out {
+                    self.aborted = true;
+                    return NONE;
+                }
                 if found && res < lang.ext_symbol_map.len() {
                     self.ext_buf.clear();
                     sc.serialize(&mut self.ext_buf);
@@ -145,6 +207,10 @@ impl<'a> Parser<'a> {
             self.lexer.start();
             let found = self.lexer.run(&lang.lex, mode);
             self.lexer.finish();
+            if self.lexer.timed_out {
+                self.aborted = true;
+                return NONE;
+            }
             if found {
                 break;
             }
@@ -196,6 +262,10 @@ impl<'a> Parser<'a> {
             self.lexer.start();
             is_keyword = self.lexer.run(&lang.keyword_lex, 0);
             self.lexer.finish();
+            if self.lexer.timed_out {
+                self.aborted = true;
+                return NONE;
+            }
             let kend = self.lexer.token_end.unwrap_or(self.lexer.pos);
             if is_keyword
                 && kend.bytes == end_byte
@@ -286,12 +356,13 @@ impl<'a> Parser<'a> {
         let lang = self.lang;
         let initial = self.st.version_count();
         let halted = self.st.halted_count();
+        let max_v = self.limits.max_versions;
         let _ = is_fragile;
         if let Some(sv) =
             self.st
                 .pop_count_fast(&self.a, version, count as u32, &mut self.scratch_trees)
         {
-            if sv > MAX_VERSION_COUNT + MAX_VERSION_COUNT_OVERFLOW + halted {
+            if sv > max_v + MAX_VERSION_COUNT_OVERFLOW + halted {
                 self.st.remove_version(sv);
                 return if self.st.version_count() > initial {
                     Some(initial)
@@ -340,7 +411,7 @@ impl<'a> Parser<'a> {
         while i < n {
             let slice = pop[i].take().unwrap();
             let sv = slice.version - removed;
-            if sv > MAX_VERSION_COUNT + MAX_VERSION_COUNT_OVERFLOW + halted {
+            if sv > max_v + MAX_VERSION_COUNT_OVERFLOW + halted {
                 self.st.remove_version(sv);
                 removed += 1;
                 while i + 1 < n && pop[i + 1].as_ref().unwrap().version == slice.version {
@@ -442,6 +513,9 @@ impl<'a> Parser<'a> {
             if needs_lex {
                 needs_lex = false;
                 lookahead = self.lex(version, state);
+                if self.aborted {
+                    return false;
+                }
                 actions = if lookahead != NONE {
                     lang.actions_for(state, self.a.n(lookahead).sym)
                 } else {
@@ -580,7 +654,7 @@ impl<'a> Parser<'a> {
                 version += 1;
             }
             let min_cost = self.condense_stack();
-            if self.aborted {
+            if self.aborted || self.check_timeout_now() {
                 return;
             }
             self.maybe_compact();

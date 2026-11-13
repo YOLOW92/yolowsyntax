@@ -68,6 +68,7 @@ impl Eq for LexAscii {}
 pub(crate) struct DenseTable {
     states: usize,
     stride: usize,
+    stripped: bool,
     data: Vec<u16>,
 }
 
@@ -243,6 +244,7 @@ impl Language {
         self.dense = DenseTable {
             states: dense_states,
             stride,
+            stripped: false,
             data,
         };
     }
@@ -468,8 +470,37 @@ impl Language {
         w.bytes(&self.reserved_set);
         w.u16s(&self.reserved_words);
         w.u32(self.max_reserved);
-        w.u32s(&self.state_start);
-        w.u32s(&self.entries);
+        if self.dense.stripped && self.dense.states > 0 {
+            let ds = self.dense.states;
+            let stride = self.dense.stride;
+            let sc = self.state_count as usize;
+            let mut prefix_len = 0u32;
+            w.u32((sc + 1) as u32);
+            w.u32(0);
+            for s in 0..ds {
+                let row = &self.dense.data[s * stride..(s + 1) * stride];
+                prefix_len += row.iter().filter(|&&v| v != 0).count() as u32;
+                w.u32(prefix_len);
+            }
+            for &off in &self.state_start[ds + 1..] {
+                w.u32(off + prefix_len);
+            }
+            w.u32(prefix_len + self.entries.len() as u32);
+            for s in 0..ds {
+                let row = &self.dense.data[s * stride..(s + 1) * stride];
+                for (sym, &val) in row.iter().enumerate() {
+                    if val != 0 {
+                        w.u32(((sym as u32) << 16) | val as u32);
+                    }
+                }
+            }
+            for &x in &self.entries {
+                w.u32(x);
+            }
+        } else {
+            w.u32s(&self.state_start);
+            w.u32s(&self.entries);
+        }
         w.u32(self.actions.len() as u32);
         for a in &self.actions {
             let (t, f, p): (u8, u8, [u16; 4]) = match *a {
@@ -524,6 +555,7 @@ impl Language {
                     *x -= d;
                 }
                 l.state_start[..ds].fill(0);
+                l.dense.stripped = true;
             }
         }
         Ok(l)
@@ -549,7 +581,7 @@ impl Language {
         l.production_id_count = r.u32()?;
         l.field_count = r.u32()?;
         l.max_alias_sequence_length = r.u32()?;
-        l.keyword_capture_token = r.u32()? as u16;
+        l.keyword_capture_token = u16::try_from(r.u32()?).map_err(|_| "关键字捕获符号越界")?;
         l.symbol_names = r.strs()?;
         l.public_symbol_map = r.u16s()?;
         l.symbol_metadata = r.bytes()?;
@@ -634,6 +666,9 @@ impl Language {
             l.ext_symbol_map = r.u16s()?;
             l.ext_valid = r.bytes()?.into_iter().map(|x| x != 0).collect();
         }
+        if r.p != b.len() {
+            return Err("语法表尾部有多余字节".into());
+        }
         l.validate()?;
         l.build_accel();
         Ok(l)
@@ -642,6 +677,18 @@ impl Language {
     /// 加载后的一致性检查，保证运行时的下标访问不会越界。
     fn validate(&self) -> Result<(), String> {
         let sc = self.state_count as usize;
+        if sc < 2 || sc > u16::MAX as usize + 1 {
+            return Err("解析状态数量无效".into());
+        }
+        if self.token_count > self.symbol_count || self.large_state_count > self.state_count {
+            return Err("语法表计数字段无效".into());
+        }
+        let total_u32 = self
+            .symbol_count
+            .checked_add(self.alias_count)
+            .filter(|&t| t <= u16::MAX as u32 + 1)
+            .ok_or("符号计数溢出")?;
+        let total = total_u32 as usize;
         if self.state_start.len() != sc + 1
             || self.lex_modes.len() != sc
             || self.reserved_set.len() != sc
@@ -653,12 +700,46 @@ impl Language {
         {
             return Err("状态偏移不单调".into());
         }
-        let total = (self.symbol_count + self.alias_count) as usize;
         if self.symbol_names.len() < total
             || self.symbol_metadata.len() < total
             || self.public_symbol_map.len() < total
         {
             return Err("符号表长度不符".into());
+        }
+        if self.field_names.len() <= self.field_count as usize && self.field_count > 0 {
+            return Err("字段名表长度不符".into());
+        }
+        for &(s, len) in &self.field_map_slices {
+            if s as usize + len as usize > self.field_map_entries.len() {
+                return Err("字段映射切片越界".into());
+            }
+        }
+        for &(f, _, _) in &self.field_map_entries {
+            if f as u32 > self.field_count {
+                return Err("字段编号越界".into());
+            }
+        }
+        if self.max_alias_sequence_length > 0 && !self.alias_sequences.is_empty() {
+            let m = self.max_alias_sequence_length as usize;
+            if !self.alias_sequences.len().is_multiple_of(m)
+                || self.alias_sequences.iter().any(|&a| a as usize >= total)
+            {
+                return Err("别名序列越界".into());
+            }
+        }
+        if self.max_reserved > 0 {
+            let m = self.max_reserved as usize;
+            if !self.reserved_words.len().is_multiple_of(m) {
+                return Err("保留字表长度不对齐".into());
+            }
+            let rows = self.reserved_words.len() / m;
+            if self
+                .reserved_set
+                .iter()
+                .any(|&id| id != 0 && id as usize >= rows)
+            {
+                return Err("保留字集编号越界".into());
+            }
         }
         let ec = self.external_token_count as usize;
         if ec > 0 {
@@ -668,28 +749,123 @@ impl Language {
             {
                 return Err("外部扫描器表长度不符".into());
             }
+            if self
+                .ext_symbol_map
+                .iter()
+                .any(|&s| s as u32 >= self.token_count)
+            {
+                return Err("外部扫描器符号越界".into());
+            }
             let rows = self.ext_valid.len() / ec;
-            if self.lex_ext.iter().any(|x| *x as usize >= rows.max(1)) {
+            if self.lex_ext.iter().any(|&x| x != 0 && x as usize >= rows) {
                 return Err("外部词法状态越界".into());
             }
         }
-        let mut i = 0;
+        let mut i = 0usize;
         while i < self.actions.len() {
-            if let Action::Header(n) = self.actions[i] {
-                i += 1 + n as usize;
-            } else {
-                i += 1;
+            match self.actions[i] {
+                Action::Header(n) => {
+                    let end = i + 1 + n as usize;
+                    if end > self.actions.len() {
+                        return Err("动作表越界".into());
+                    }
+                    for act in &self.actions[i + 1..end] {
+                        match *act {
+                            Action::Header(_) => return Err("动作体内嵌套头节点".into()),
+                            Action::Shift { state, extra, .. } => {
+                                if !extra && state as usize >= sc {
+                                    return Err("Shift 目标状态越界".into());
+                                }
+                            }
+                            Action::Reduce { symbol, prod, .. } => {
+                                if (symbol as u32) < self.token_count
+                                    || symbol as usize >= total
+                                    || prod as u32 >= self.production_id_count.max(1)
+                                {
+                                    return Err("Reduce 目标越界".into());
+                                }
+                            }
+                            Action::Accept | Action::Recover => {}
+                        }
+                    }
+                    i = end;
+                }
+                _ => return Err("动作表缺少头节点".into()),
             }
         }
-        if i != self.actions.len() {
-            return Err("动作表越界".into());
+        for s in 0..sc {
+            let (a, b) = (
+                self.state_start[s] as usize,
+                self.state_start[s + 1] as usize,
+            );
+            let mut prev_sym: Option<usize> = None;
+            for &ent in &self.entries[a..b] {
+                let sym = (ent >> 16) as usize;
+                let val = (ent & 0xFFFF) as usize;
+                if sym >= total || val == 0 {
+                    return Err("状态表项符号或值无效".into());
+                }
+                if let Some(ps) = prev_sym
+                    && sym <= ps
+                {
+                    return Err("状态表项未严格升序".into());
+                }
+                prev_sym = Some(sym);
+                if (sym as u32) < self.token_count {
+                    if !matches!(self.actions.get(val), Some(Action::Header(_))) {
+                        return Err("终结符动作下标无效".into());
+                    }
+                } else if val >= sc {
+                    return Err("非终结符 Goto 状态越界".into());
+                }
+            }
         }
-        for t in [&self.lex, &self.keyword_lex] {
-            if (t.starts.is_empty() || *t.starts.last().unwrap() as usize != t.segs.len())
-                && !(t.starts.is_empty() && t.segs.is_empty())
+        for (idx, t) in [&self.lex, &self.keyword_lex].iter().enumerate() {
+            if t.starts.is_empty() && t.segs.is_empty() {
+                if idx == 0 {
+                    return Err("缺少主词法表".into());
+                }
+                continue;
+            }
+            if t.starts.len() < 2
+                || t.starts.windows(2).any(|w| w[0] > w[1])
+                || *t.starts.last().unwrap() as usize != t.segs.len()
             {
                 return Err("词法表偏移不符".into());
             }
+            let lsc = t.state_count();
+            for ls in 0..lsc {
+                let (a, b) = (t.starts[ls] as usize, t.starts[ls + 1] as usize);
+                let mut prev_lo: Option<u32> = None;
+                for seg in &t.segs[a..b] {
+                    if let Some(pl) = prev_lo
+                        && seg.lo <= pl
+                    {
+                        return Err("词法段区间未严格递增".into());
+                    }
+                    prev_lo = Some(seg.lo);
+                    if seg.accept != NO_SYM && seg.accept as u32 >= self.token_count {
+                        return Err("词法段接受符号越界".into());
+                    }
+                    if seg.kind() > 2 || (seg.kind() != 0 && seg.target() as usize >= lsc) {
+                        return Err("词法段转移目标越界".into());
+                    }
+                }
+            }
+        }
+        let main_lex_sc = self.lex.state_count();
+        if self
+            .lex_modes
+            .iter()
+            .any(|&m| m != 0xFFFF && m as usize >= main_lex_sc)
+        {
+            return Err("词法模式状态越界".into());
+        }
+        if self.keyword_capture_token != 0
+            && (self.keyword_capture_token as u32 >= self.token_count
+                || self.keyword_lex.state_count() == 0)
+        {
+            return Err("关键字捕获配置无效".into());
         }
         Ok(())
     }
@@ -758,7 +934,15 @@ impl R<'_> {
     }
     fn strs(&mut self) -> Result<Vec<String>, String> {
         let n = self.u32()? as usize;
-        (0..n).map(|_| self.str()).collect()
+        let max_items = (self.b.len() - self.p) / 4;
+        if n > max_items {
+            return Err("字符串计数越界".into());
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.str()?);
+        }
+        Ok(out)
     }
     fn u16s(&mut self) -> Result<Vec<u16>, String> {
         let n = self.u32()? as usize;

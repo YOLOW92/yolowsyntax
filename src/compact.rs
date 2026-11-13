@@ -16,6 +16,9 @@ impl Parser<'_> {
             self.compact_stack();
         }
         if self.a.nodes.len() > MIN_TRIGGER.max(self.live_after.saturating_mul(2)) {
+            if self.st.nodes.len() > 1 {
+                self.compact_stack();
+            }
             self.compact_arena();
         }
     }

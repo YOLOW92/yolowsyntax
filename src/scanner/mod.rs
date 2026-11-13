@@ -103,7 +103,7 @@ impl<'l, 'a> ScanLexer<'l, 'a> {
         }
     }
     fn exhausted(&self) -> bool {
-        self.ops > self.limit
+        self.ops > self.limit || self.lx.timed_out
     }
     /// 当前前瞻字符，输入结束返回 '\0'。
     pub fn lookahead(&self) -> char {
@@ -123,6 +123,9 @@ impl<'l, 'a> ScanLexer<'l, 'a> {
     /// 前进一个字符；`skip` 为真时该字符算作记号前的空白。
     pub fn advance(&mut self, skip: bool) {
         self.ops += 1;
+        if self.ops.is_multiple_of(4096) {
+            self.lx.check_deadline();
+        }
         if !self.exhausted() {
             self.lx.advance(skip);
         }
@@ -140,7 +143,7 @@ impl<'l, 'a> ScanLexer<'l, 'a> {
         self.result = sym;
     }
     /// 当前位置在行内的列号（按字符计）。
-    pub fn column(&self) -> u32 {
+    pub fn column(&mut self) -> u32 {
         self.lx.column()
     }
 }

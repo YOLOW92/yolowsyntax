@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 - 2026-11-13
+
+- Wire `Limits.max_versions` into `Parser::reduce` and GLR recovery (default `6`, retaining `MAX_VERSION_COUNT_OVERFLOW = 4`), check oversized inputs and zero budgets before preallocation via `Parser::try_new`, cap initial `Arena` reserve capacity (`32,768` nodes), enforce `kids` arena budget, and drop oversized parser state when returning a tiny `truncated` degraded tree.
+- Add batched cooperative wall-clock deadline checks (`Limits.max_millis`, default `0` = disabled) across `Lexer::run`, external scanners (`ScanLexer`), error recovery, and pre-compaction checks, plus incremental `Lexer::column` caching to avoid O(N²) scans on long single lines.
+- Harden grammar table deserialization (`Language::from_bytes` / `validate`) against truncated payloads, oversized string count preallocations, out-of-range states/symbols/aliases/fields/lex modes/scanner maps, and non-monotonic lexer states; fix `DenseTable` + `Language::to_bytes()` roundtrip fidelity so runtime tables serialize cleanly without losing stripped prefix entries.
+- Fix `compact::maybe_compact` to run `compact_stack()` before `compact_arena()` when dead GLR stack heads would otherwise pin unreachable AST nodes.
+- Add `tests/safety.rs` regression tests and upgrade `benchmarks/compare` + `benchmarks/fetch_corpus.py` to assert parse parity, verify lossless `outline()` reconstruction vs `None`, and measure standalone real OSS files (`real-bench`).
+- Clarify scope, `Limits` cooperative semantics, `outline()` rules (32 symbol languages vs 9 tree-only languages), corpus skip counts (`22` `:language(...)` skips across `5,897` cases), and MIT / Apache-2.0 attributions across README and `THIRD-PARTY.md`.
+
 ## 0.1.1 - 2026-11-13
 
 - Replace `miniz_oxide` with pure-Rust [`yolowzstd`](https://crates.io/crates/yolowzstd) (`0.1.2`, `#![forbid(unsafe_code)]`) and recompress all 41 `.pslg.z` tables with Zstd level 19 (`6.52 MB` / `6.2 MiB` on disk, down 29.4% from `9.23 MB` zlib).

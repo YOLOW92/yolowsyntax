@@ -9,10 +9,9 @@
 - tree-sitter（https://github.com/tree-sitter/tree-sitter），提交 9632b56（2026-11-02），MIT。
   Copyright (c) 2014 Max Brunsfeld
 
-## 语法
+## 语法与移植外部扫描器
 
-语法表由 `ts-convert` 从各仓库生成的 `src/parser.c` 转换而来；仓库里只放 JSON 的表和 corpus 做测试，
-其余语言的表放在仓库之外，不随代码分发。以下均为 MIT 许可，版权声明如下。
+内嵌的 41 份语法表由 `ts-convert` 从各上游仓库生成的 `src/parser.c` 离线转换，并以 Zstd 压缩保存在 `tables/*.pslg.z`；仓库里另存一份 JSON 表与 corpus（`tests/data/json.pslg`）用作独立测试夹具。下列上游项目分别采用 **MIT** 或 **Apache License 2.0** 宽松许可，各自版权声明与许可类型如下（未标注 Apache-2.0 者均为 MIT；`src/scanner/toml.rs` 为保留的扫描器移植代码，TOML 未纳入当前 41 门内嵌语法）：
 
 | 语法 | 仓库 | 版本 / 提交 | 版权声明 |
 | --- | --- | --- | --- |
@@ -69,3 +68,7 @@ MIT 许可全文：
 > to permit persons to whom the Software is furnished to do so, subject to the following conditions: The above
 > copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+
+Apache License 2.0（适用于上表标注 `Apache License 2.0` 的 Elixir、Gleam、Erlang、HCL 语法表与对应外部扫描器移植）：
+
+- Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).

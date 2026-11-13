@@ -1,6 +1,6 @@
 //! 错误恢复与版本裁剪（对应官方 `parser.c` 中的 recover / handle_error / condense_stack）。
 
-use crate::parser::{MAX_SUMMARY_DEPTH, MAX_VERSION_COUNT, Parser, ReduceAction};
+use crate::parser::{MAX_SUMMARY_DEPTH, Parser, ReduceAction};
 use crate::stack::ERROR_STATE;
 use crate::table::{Action, SYM_ERROR_REPEAT};
 use crate::tree::*;
@@ -185,7 +185,7 @@ impl Parser<'_> {
             }
             if has_shift {
                 can_shift = true;
-            } else if reduction.is_some() && ci < MAX_VERSION_COUNT {
+            } else if reduction.is_some() && ci < self.limits.max_versions {
                 self.st.renumber_version(reduction.unwrap(), version);
                 continue;
             } else if lookahead_symbol != 0 {
@@ -301,7 +301,7 @@ impl Parser<'_> {
             self.accept(version, lookahead);
             return;
         }
-        if did_recover && self.st.version_count() > MAX_VERSION_COUNT {
+        if did_recover && self.st.version_count() > self.limits.max_versions {
             self.st.halt(version);
             return;
         }
@@ -367,6 +367,9 @@ impl Parser<'_> {
             if !did_insert {
                 let state = self.st.state(v);
                 for missing in 1..(lang.token_count as u16) {
+                    if missing & 31 == 0 && self.over_budget() {
+                        return;
+                    }
                     let after = lang.next_state(state, missing);
                     if after == 0 || after == state {
                         continue;
@@ -442,15 +445,19 @@ impl Parser<'_> {
             }
             i += 1;
         }
-        while self.st.version_count() > MAX_VERSION_COUNT {
-            self.st.remove_version(MAX_VERSION_COUNT);
+        let max_v = self.limits.max_versions;
+        while self.st.version_count() > max_v {
+            self.st.remove_version(max_v);
         }
         if self.st.version_count() > 0 {
             let mut has_unpaused = false;
             let mut i = 0usize;
             while i < self.st.version_count() {
+                if self.over_budget() {
+                    return min_cost;
+                }
                 if self.st.is_paused(i) {
-                    if !has_unpaused && (self.accept_count as usize) < MAX_VERSION_COUNT {
+                    if !has_unpaused && (self.accept_count as usize) < max_v {
                         min_cost = self.st.error_cost(i);
                         let la = self.st.resume(i);
                         self.handle_error(i, la);

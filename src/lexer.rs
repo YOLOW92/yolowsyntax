@@ -2,6 +2,7 @@
 
 use crate::table::{EOF_CP, LexTable, NO_SYM};
 use crate::tree::Len;
+use std::time::Instant;
 
 pub struct Lexer<'a> {
     pub input: &'a [u8],
@@ -9,6 +10,11 @@ pub struct Lexer<'a> {
     pub token_start: Len,
     pub token_end: Option<Len>,
     pub result: u16,
+    deadline: Option<Instant>,
+    pub timed_out: bool,
+    col_row: u32,
+    col_byte: u32,
+    col_val: u32,
 }
 
 /// 解码一个码点，非法字节当作 U+FFFD 前进一字节。
@@ -51,7 +57,26 @@ impl<'a> Lexer<'a> {
             token_start: Len::default(),
             token_end: None,
             result: 0,
+            deadline: None,
+            timed_out: false,
+            col_row: 0,
+            col_byte: 0,
+            col_val: 0,
         }
+    }
+    #[inline]
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+    #[inline]
+    pub fn check_deadline(&mut self) -> bool {
+        if let Some(dl) = self.deadline
+            && Instant::now() >= dl
+        {
+            self.timed_out = true;
+            return true;
+        }
+        false
     }
     pub fn reset(&mut self, p: Len) {
         self.pos = p;
@@ -88,17 +113,28 @@ impl<'a> Lexer<'a> {
         }
     }
     /// 当前位置在行内的列号（按码点计，对应官方 `get_column`）。
-    pub fn column(&self) -> u32 {
+    pub fn column(&mut self) -> u32 {
         let end = (self.pos.bytes as usize).min(self.input.len());
-        let start = self.input[..end]
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |i| i + 1);
-        let (mut i, mut n) = (start, 0u32);
-        while i < end {
-            i += decode(self.input, i).1;
-            n += 1;
+        let (mut i, mut n) = if self.pos.rows == self.col_row && end >= self.col_byte as usize {
+            (self.col_byte as usize, self.col_val)
+        } else {
+            let start = self.input[..end]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |k| k + 1);
+            (start, 0u32)
+        };
+        if self.input[i..end].is_ascii() {
+            n += (end - i) as u32;
+        } else {
+            while i < end {
+                i += decode(self.input, i).1;
+                n += 1;
+            }
         }
+        self.col_row = self.pos.rows;
+        self.col_byte = end as u32;
+        self.col_val = n;
         n
     }
     pub fn mark_end(&mut self) {
@@ -121,7 +157,12 @@ impl<'a> Lexer<'a> {
         let mut found = false;
         // 在输入末尾“前进”不会移动位置；词法表若在末尾处成环就永远不会停，所以限制连续次数
         let mut stuck = 0u32;
+        let mut ticks = 0u32;
         loop {
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(4096) && self.check_deadline() {
+                return false;
+            }
             let i = self.pos.bytes as usize;
             if i < len {
                 let b = input[i];

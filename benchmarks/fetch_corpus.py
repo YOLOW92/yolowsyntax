@@ -99,10 +99,74 @@ def fetch_one(name: str, url: str, rev: str, preferred: list[str]) -> str:
     return f"[ok] {name} @ {rev} -> {paths}"
 
 
+REAL_SOURCES = [
+    (
+        "c.c",
+        "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.3/lib/src/parser.c",
+        "27737a8b41c0a75430d8226faabf3f72d8bf422835ca2300cbf95789e185a5ce",
+    ),
+    (
+        "go.go",
+        "https://raw.githubusercontent.com/golang/go/go1.23.0/src/encoding/json/decode.go",
+        "2c4d202bbce137c4d75bbbb25d111f9190dba68c84da2137f733e0d3fe893e7a",
+    ),
+    (
+        "java.java",
+        "https://raw.githubusercontent.com/google/guava/v33.3.1/guava/src/com/google/common/collect/ImmutableList.java",
+        "a5012324a2c0f9deae963d6945be5522ff719fcf31577205aa4df448d4fe0f8f",
+    ),
+    (
+        "python.py",
+        "https://raw.githubusercontent.com/python/cpython/v3.13.0/Lib/argparse.py",
+        "67267741eccb30cfa2a03e76b0c2e3f70641c944b0240ee600cca22cd6ef0a34",
+    ),
+    (
+        "javascript.js",
+        "https://raw.githubusercontent.com/moment/moment/2.30.1/moment.js",
+        "7dc0a51c32dae143f2eade235145dfd6a7756388c0f0bf409fa373dd6c233629",
+    ),
+    (
+        "typescript.ts",
+        "https://raw.githubusercontent.com/colinhacks/zod/v3.23.8/src/types.ts",
+        "e98b4b517c2552aea380980d5669ea9a88dc40cb2a163a3bb188575aa4ddecc8",
+    ),
+    (
+        "rust.rs",
+        "https://raw.githubusercontent.com/BurntSushi/ripgrep/14.1.1/crates/searcher/src/searcher/mod.rs",
+        "b1ba96daf77e0298c70bc2b381d2b50b358b632c6dfa954e5a0925f0ace32e27",
+    ),
+    (
+        "bash.sh",
+        "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/nvm.sh",
+        "dc84afb1ded75cccdb1a62b35d99ecbbc0c8653eb70224cd3c1c01c171340ddf",
+    ),
+]
+
+
+def fetch_real_one(filename: str, url: str, expected_sha256: str) -> str:
+    import hashlib
+    import urllib.request
+
+    real_dir = CORPUS_DIR / "_real"
+    real_dir.mkdir(parents=True, exist_ok=True)
+    dest = real_dir / filename
+    if dest.exists():
+        got = hashlib.sha256(dest.read_bytes()).hexdigest()
+        if got == expected_sha256:
+            return f"[cached] _real/{filename} ({dest.stat().st_size} B)"
+    data = urllib.request.urlopen(url, timeout=30).read()
+    got = hashlib.sha256(data).hexdigest()
+    if got != expected_sha256:
+        raise RuntimeError(f"sha256 mismatch for {filename}: {got} != {expected_sha256}")
+    dest.write_bytes(data)
+    return f"[ok] _real/{filename} ({len(data)} B)"
+
+
 def main() -> None:
     CORPUS_DIR.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=8) as pool:
         futs = [pool.submit(fetch_one, *entry) for entry in REPOS]
+        futs += [pool.submit(fetch_real_one, *entry) for entry in REAL_SOURCES]
         for fut in as_completed(futs):
             print(fut.result())
 

@@ -33,29 +33,45 @@ pub enum Ev<'a> {
     Close,
 }
 
+fn degraded_tree(lang: &Language, input_len: usize) -> ParseTree {
+    let mut arena = Arena::default();
+    let size = Len {
+        bytes: input_len.min(u32::MAX as usize) as u32,
+        rows: 0,
+    };
+    let root = arena.new_leaf(lang, SYM_ERROR, Len::default(), size);
+    arena.n_mut(root).error_cost = 1;
+    ParseTree {
+        arena,
+        root,
+        truncated: true,
+        input_len,
+    }
+}
+
 /// 解析一段字节输入。输入不可信：任何资源上限被触发都返回退化的树而不是崩溃。
 pub fn parse(lang: &Language, input: &[u8], limits: Limits) -> ParseTree {
-    let mut p = Parser::new(lang, input, limits);
-    if input.len() >= u32::MAX as usize / 2 {
-        p.aborted = true;
-    } else {
-        p.run();
+    if input.len() >= u32::MAX as usize / 2
+        || limits.max_nodes == 0
+        || limits.max_versions == 0
+        || lang.state_count < 2
+        || lang.lex.state_count() == 0
+    {
+        return degraded_tree(lang, input.len());
     }
-    let (mut root, mut truncated) = (p.finished, false);
+    let Some(mut p) = Parser::try_new(lang, input, limits) else {
+        return degraded_tree(lang, input.len());
+    };
+    p.run();
+    let root = p.finished;
     if root == NONE || p.aborted {
-        // 退化：整段输入作为一个 ERROR 叶子
-        let size = Len {
-            bytes: input.len() as u32,
-            rows: input.iter().filter(|b| **b == b'\n').count() as u32,
-        };
-        root = p.a.new_leaf(lang, SYM_ERROR, Len::default(), size);
-        p.a.n_mut(root).error_cost = 1;
-        truncated = true;
+        drop(p);
+        return degraded_tree(lang, input.len());
     }
     ParseTree {
         arena: p.a,
         root,
-        truncated,
+        truncated: false,
         input_len: input.len(),
     }
 }
