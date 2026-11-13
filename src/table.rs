@@ -129,7 +129,12 @@ impl LexTable {
     #[inline]
     pub(crate) fn find_ascii(&self, state: u16, byte: u8) -> Seg {
         let st = state as usize;
-        let idx = self.ascii.0.get(st * 128 + byte as usize).copied().unwrap_or(255);
+        let idx = self
+            .ascii
+            .0
+            .get(st * 128 + byte as usize)
+            .copied()
+            .unwrap_or(255);
         if idx < 255 {
             self.segs[self.starts[st] as usize + idx as usize]
         } else {
@@ -223,7 +228,10 @@ impl Language {
         }
         let mut data = vec![0u16; dense_states * stride];
         for s in 0..dense_states {
-            let (a, b) = (self.state_start[s] as usize, self.state_start[s + 1] as usize);
+            let (a, b) = (
+                self.state_start[s] as usize,
+                self.state_start[s + 1] as usize,
+            );
             let row = &mut data[s * stride..(s + 1) * stride];
             for &x in &self.entries[a..b] {
                 let sym = (x >> 16) as usize;
@@ -301,7 +309,10 @@ impl Language {
             }
             return;
         }
-        let (s, e) = (self.state_start[st] as usize, self.state_start[st + 1] as usize);
+        let (s, e) = (
+            self.state_start[st] as usize,
+            self.state_start[st + 1] as usize,
+        );
         for &ent in &self.entries[s..e] {
             let sym = (ent >> 16) as u16;
             if sym == 0 || sym as u32 >= self.token_count {

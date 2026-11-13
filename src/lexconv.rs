@@ -369,7 +369,10 @@ pub fn convert_lex(
         cuts.dedup();
         let mut last: Option<Seg> = None;
         for &lo in &cuts {
-            let seg = Seg { lo, ..eval(body, lo) };
+            let seg = Seg {
+                lo,
+                ..eval(body, lo)
+            };
             match last {
                 Some(l) if l.accept == seg.accept && l.packed == seg.packed => {}
                 _ => {

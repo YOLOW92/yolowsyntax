@@ -287,9 +287,9 @@ impl<'a> Parser<'a> {
         let initial = self.st.version_count();
         let halted = self.st.halted_count();
         let _ = is_fragile;
-        if let Some(sv) = self
-            .st
-            .pop_count_fast(&self.a, version, count as u32, &mut self.scratch_trees)
+        if let Some(sv) =
+            self.st
+                .pop_count_fast(&self.a, version, count as u32, &mut self.scratch_trees)
         {
             if sv > MAX_VERSION_COUNT + MAX_VERSION_COUNT_OVERFLOW + halted {
                 self.st.remove_version(sv);
