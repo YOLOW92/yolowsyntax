@@ -331,6 +331,7 @@ pub fn convert_lex(
     let mut table = LexTable {
         starts: vec![0; max + 1],
         segs: Vec::new(),
+        ..Default::default()
     };
     let mut by_state: Vec<Option<&Vec<St>>> = vec![None; max];
     for (n, b) in &states {
@@ -341,12 +342,7 @@ pub fn convert_lex(
         let body = match slot {
             Some(b) => *b,
             None => {
-                table.segs.push(Seg {
-                    lo: 0,
-                    accept: NO_SYM,
-                    kind: 0,
-                    target: 0,
-                });
+                table.segs.push(Seg::new(0, NO_SYM, 0, 0));
                 continue;
             }
         };
@@ -373,11 +369,9 @@ pub fn convert_lex(
         cuts.dedup();
         let mut last: Option<Seg> = None;
         for &lo in &cuts {
-            let seg = eval(body, lo);
-            let seg = Seg { lo, ..seg };
+            let seg = Seg { lo, ..eval(body, lo) };
             match last {
-                Some(l)
-                    if l.accept == seg.accept && l.kind == seg.kind && l.target == seg.target => {}
+                Some(l) if l.accept == seg.accept && l.packed == seg.packed => {}
                 _ => {
                     table.segs.push(seg);
                     last = Some(seg);
@@ -391,12 +385,7 @@ pub fn convert_lex(
 
 fn eval(body: &[St], x: u32) -> Seg {
     let mut accept = NO_SYM;
-    let fin = |accept: u16, kind: u8, target: u16| Seg {
-        lo: 0,
-        accept,
-        kind,
-        target,
-    };
+    let fin = |accept: u16, kind: u8, target: u16| Seg::new(0, accept, kind, target);
     for s in body {
         let act = match s {
             St::If(set, a) => {

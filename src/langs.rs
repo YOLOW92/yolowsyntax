@@ -1,6 +1,6 @@
 //! 语言标记到内嵌语法表的映射，以及各语言的节点名规则。
 //!
-//! 表是编译进二进制的 zlib 压缩数据，第一次用到某种语言时才解压并缓存；没用到的语言不占内存。
+//! 表是编译进二进制的 zstd 压缩数据，第一次用到某种语言时才解压并缓存；没用到的语言不占内存。
 //! 节点名以各官方语法的 `src/node-types.json` 为准。
 
 use std::sync::OnceLock;
@@ -160,12 +160,8 @@ impl Lang {
         CACHE[self.index()]
             .get_or_init(|| {
                 // 最大的表（C++）解压后约 6 MB，上限留到 32 MB
-                let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
-                    self.compressed(),
-                    32 << 20,
-                )
-                .ok()?;
-                Language::from_bytes(&raw).ok()
+                let raw = yolowzstd::decompress(self.compressed(), 32 << 20).ok()?;
+                Language::from_bytes_runtime(&raw).ok()
             })
             .as_ref()
     }

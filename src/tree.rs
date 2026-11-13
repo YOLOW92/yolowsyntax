@@ -47,6 +47,7 @@ pub struct Node {
     pub prod: u16,
     pub padding: Len,
     pub size: Len,
+    /// `child_count > 0` 时为 `kids` 起始下标；`child_count == 0` 时复用存放 ERROR 叶子跳过的首字符（`lchar`）。
     pub first_child: u32,
     pub child_count: u32,
     pub error_cost: u32,
@@ -54,13 +55,25 @@ pub struct Node {
     pub visible_descendants: u32,
     pub visible_children: u32,
     pub named_children: u32,
-    /// 词法跳过的非法字符（ERROR 叶子）。
-    pub lchar: u32,
     /// 最后一个外部记号之后的扫描器状态编号（`Arena::ext_bytes` 的下标），子树里没有外部记号为 NONE。
     pub ext: u32,
 }
 
 impl Node {
+    #[inline]
+    pub fn lchar(&self) -> u32 {
+        if self.child_count == 0 {
+            self.first_child
+        } else {
+            0
+        }
+    }
+    #[inline]
+    pub fn set_lchar(&mut self, ch: u32) {
+        if self.child_count == 0 {
+            self.first_child = ch;
+        }
+    }
     #[inline]
     pub fn extra(&self) -> bool {
         self.flags & F_EXTRA != 0
@@ -171,7 +184,6 @@ impl Arena {
             visible_descendants: 0,
             visible_children: 0,
             named_children: 0,
-            lchar: 0,
             ext: NONE,
         })
     }
@@ -204,7 +216,6 @@ impl Arena {
             visible_descendants: 0,
             visible_children: 0,
             named_children: 0,
-            lchar: 0,
             ext: NONE,
         };
         if lang.visible(sym) {

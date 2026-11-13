@@ -13,15 +13,15 @@
 
 </div>
 
-A pure-Rust parser runtime compatible with tree-sitter grammar tables and external scanners, extracted from [PageSift](https://github.com/YOLOW92/pagesift) and released under the **MIT License**. Zero C compiler required at build time, `#![forbid(unsafe_code)]`, a single runtime dependency (`miniz_oxide`), and embedded compressed parse tables for **41 languages** with lazy per-language decompression and structural code outline extraction.
+A pure-Rust parser runtime compatible with tree-sitter grammar tables and external scanners, extracted from [PageSift](https://github.com/YOLOW92/pagesift) and released under the **MIT License**. Zero C compiler required at build time, `#![forbid(unsafe_code)]`, a single pure-Rust runtime dependency ([`yolowzstd`](https://crates.io/crates/yolowzstd), `#![forbid(unsafe_code)]`), and embedded Zstd-compressed parse tables for **41 languages** with lazy per-language decompression and structural code outline extraction.
 
 ---
 
 ## At a Glance
 
-- **Zero C Toolchain, 100% Safe Rust**: No `cc`, no `bindgen`, no FFI, and `#![forbid(unsafe_code)]`. Cross-compiles cleanly to any Rust target with only `miniz_oxide` at runtime.
-- **41 Embedded Languages, Lazy Decompression**: Ships zlib-compressed `.pslg.z` parse tables (`5.8 MiB` `.crate` package) and pure-Rust ports of upstream external scanners. Only the languages you actually call are decompressed and cached via `OnceLock`.
-- **855 / 855 (100.00%) Official Corpus Pass Rate**: Passes every test case across all 8 benchmarked official tree-sitter corpora (`C`, `Go`, `Java`, `Python`, `JavaScript`, `TypeScript`, `Rust`, `Bash`) at **0.83×–1.75×** the speed of the C `tree-sitter` runtime.
+- **Zero C Toolchain, 100% Safe Rust**: No `cc`, no `bindgen`, no FFI, and `#![forbid(unsafe_code)]` end-to-end (including `yolowzstd` at runtime). Cross-compiles cleanly to any Rust target.
+- **41 Embedded Languages, Lazy Zstd Decompression**: Ships Zstd-compressed `.pslg.z` parse tables (`6.2 MiB` across 41 grammars; `6.3 MiB` `.crate` package) and pure-Rust ports of upstream external scanners. Only the languages you actually call are decompressed (`0.04–10.23 ms` cold load) and cached via `OnceLock`.
+- **5,875 / 5,875 (100.00%) Across All 41 Official Corpora**: Passes every active test case across all **41 languages** (`5,875 / 5,875`, with `22` upstream-marked skips) and achieves **1.94×–4.10×** the parse speed of the C `tree-sitter` runtime across all 8 benchmarked languages (`C`, `Go`, `Java`, `Python`, `JavaScript`, `TypeScript`, `Rust`, `Bash`).
 - **Built-In Code Outline Extraction (`outline`)**: Turns source files into top-level `sections` (losslessly concatenating back to the original source), `symbols` (functions, methods, structs, classes, enums, traits, interfaces, types), and `imports` for RAG and code chunking.
 - **Hard Resource Budgets (`Limits`)**: Every parse enforces bounded GLR stack depth, version count, node count, step budget, and wall-clock timeout—returning a bounded `truncated` tree instead of panicking or OOMing on adversarial inputs.
 
@@ -36,8 +36,8 @@ Using the standard C `tree-sitter` ecosystem meant pulling in a C compiler (`cc`
 At the same time, we did not need incremental editing for a live IDE buffer—we needed a **one-shot, sand-boxed, pure-Rust parser** that could run safely inside multi-threaded pipelines across Linux, macOS, and Windows without touching a C toolchain.
 
 So we built `yolowsyntax`:
-1. **A compact `.pslg.z` binary table converter (`ts-convert`)** that reads upstream `parser.c` files offline and packs their parse tables into zlib-compressed blobs (`miniz_oxide` inflates a language lazily on first use).
-2. **A safe GLR parser runtime (`#![forbid(unsafe_code)]`)** implementing tree-sitter lexing, error recovery, version merging/pruning, and pure-Rust ports of the upstream external scanners, guarded at every step by explicit `Limits`.
+1. **A compact `.pslg.z` binary table converter (`ts-convert`)** that reads upstream `parser.c` files offline and packs their parse tables into Zstd-compressed blobs (`yolowzstd` decompresses a language lazily on first use).
+2. **A safe GLR parser runtime (`#![forbid(unsafe_code)]`)** implementing dense O(1) lookup tables, ASCII lexer fast paths, tree-sitter error recovery, version merging/pruning, and pure-Rust ports of the upstream external scanners, guarded at every step by explicit `Limits`.
 3. **A lossless code outline layer (`outline`)** that extracts top-level symbols, imports, and contiguous byte-range `sections` (`sections` joined == original file) for Markdown code chunking.
 
 Extracted from PageSift (`pagesift-syntax`) and relicensed under **MIT**, `yolowsyntax` now stands on its own so any Rust project can embed 41 tree-sitter grammars without a single line of C.
@@ -122,18 +122,18 @@ println!("{}", tree.to_sexp(lang));
 
 ## Benchmarks
 
-Measured on Intel Core i7-10700 (pinned with `taskset -c 4`), Linux x86-64, `rustc 1.99.0` (`--release`, `lto = "fat"`, `codegen-units = 1`) against `tree-sitter 0.26.13` + official C grammar crates on ~64 KiB inputs (median of 25 alternating rounds) and 8 official `test/corpus` suites. Full reproduction scripts and RSS numbers are in [`benchmarks/README.md`](benchmarks/README.md).
+Measured on Intel Core i7-10700 (pinned with `taskset -c 4`), Linux x86-64, `rustc 1.99.0` (`--release`, `lto = "fat"`, `codegen-units = 1`) against `tree-sitter 0.26.13` + official C grammar crates on ~64 KiB inputs (median of 25 alternating rounds) and all **41 official `test/corpus` suites** (`5,875 / 5,875` passing). Full reproduction scripts, RSS data, and 41-language results are in [`benchmarks/README.md`](benchmarks/README.md).
 
-| Language | Corpus (`yolowsyntax`) | `yolowsyntax` parse (ms ↓) | C `tree-sitter` parse (ms ↓) | `yolowsyntax` `outline` (ms ↓) | Speed (`ts / yolow`) |
+| Language | Corpus (`yolowsyntax`) | `yolowsyntax` parse (ms ↓) | C `tree-sitter` parse (ms ↓) | `yolowsyntax` `outline` (ms ↓) | Speed (`ts / yolow` ↑) |
 |---|---:|---:|---:|---:|---:|
-| C | **85 / 85 (100%)** | **12.905** | 22.637 | 14.735 | **1.75×** |
-| Go | **67 / 67 (100%)** | 13.507 | **11.781** | 15.754 | 0.87× |
-| Java | **108 / 108 (100%)** | 11.546 | **9.595** | 13.109 | 0.83× |
-| Python | **117 / 117 (100%)** | 16.254 | **16.252** | 18.493 | 1.00× |
-| JavaScript | **116 / 116 (100%)** | **13.872** | 14.051 | 15.785 | **1.01×** |
-| TypeScript | **111 / 111 (100%)** | 13.435 | **12.657** | 15.492 | 0.94× |
-| Rust | **151 / 151 (100%)** | 14.745 | **14.511** | 16.948 | 0.98× |
-| Bash | **100 / 100 (100%)** | **22.400** | 27.404 | 24.336 | **1.22×** |
+| C | **85 / 85 (100%)** | **5.243** | 21.504 | 6.571 | **4.10×** |
+| Go | **67 / 67 (100%)** | **6.129** | 11.899 | 7.324 | **1.94×** |
+| Java | **108 / 108 (100%)** | **3.966** | 9.616 | 5.278 | **2.42×** |
+| Python | **117 / 117 (100%)** | **7.392** | 16.342 | 9.261 | **2.21×** |
+| JavaScript | **116 / 116 (100%)** | **7.022** | 14.349 | 8.373 | **2.04×** |
+| TypeScript | **111 / 111 (100%)** | **5.314** | 12.188 | 6.872 | **2.29×** |
+| Rust | **151 / 151 (100%)** | **5.483** | 14.602 | 7.418 | **2.66×** |
+| Bash | **100 / 100 (100%)** | **13.515** | 27.234 | 15.256 | **2.02×** |
 
 ---
 

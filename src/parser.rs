@@ -27,6 +27,7 @@ pub struct Parser<'a> {
     pub live_st_after: usize,
     pub scanner: Option<Box<dyn Scanner>>,
     ext_buf: Vec<u8>,
+    scratch_trees: Vec<u32>,
 }
 
 pub struct ReduceAction {
@@ -69,6 +70,7 @@ impl<'a> Parser<'a> {
             live_st_after: 0,
             scanner,
             ext_buf: Vec::new(),
+            scratch_trees: Vec::with_capacity(32),
         }
     }
 
@@ -175,7 +177,7 @@ impl<'a> Parser<'a> {
                 err_start.sub(start),
                 err_end.sub(err_start),
             );
-            self.a.n_mut(leaf).lchar = first_char;
+            self.a.n_mut(leaf).set_lchar(first_char);
             return leaf;
         }
         let mut symbol = self.lexer.result;
@@ -283,13 +285,58 @@ impl<'a> Parser<'a> {
     ) -> Option<usize> {
         let lang = self.lang;
         let initial = self.st.version_count();
+        let halted = self.st.halted_count();
+        let _ = is_fragile;
+        if let Some(sv) = self
+            .st
+            .pop_count_fast(&self.a, version, count as u32, &mut self.scratch_trees)
+        {
+            if sv > MAX_VERSION_COUNT + MAX_VERSION_COUNT_OVERFLOW + halted {
+                self.st.remove_version(sv);
+                return if self.st.version_count() > initial {
+                    Some(initial)
+                } else {
+                    None
+                };
+            }
+            let total = self.scratch_trees.len();
+            let mut split = total;
+            while split > 0 && self.a.n(self.scratch_trees[split - 1]).extra() {
+                split -= 1;
+            }
+            let parent = self
+                .a
+                .new_node(lang, symbol, &self.scratch_trees[..split], prod);
+            let state = self.st.state(sv);
+            let next_state = lang.next_state(state, symbol);
+            if end_of_extra && next_state == state {
+                self.a.n_mut(parent).flags |= F_EXTRA;
+            }
+            self.a.n_mut(parent).dprec += dprec as i32;
+            self.st.push(&self.a, sv, parent, false, next_state);
+            for i in split..total {
+                let t = self.scratch_trees[i];
+                self.st.push(&self.a, sv, t, false, next_state);
+            }
+            for j in 0..sv {
+                if j == version {
+                    continue;
+                }
+                if self.st.merge(&self.a, j, sv) {
+                    break;
+                }
+            }
+            return if self.st.version_count() > initial {
+                Some(initial)
+            } else {
+                None
+            };
+        }
         let pop = self.st.pop_count(&self.a, version, count as u32);
         let mut removed = 0usize;
-        let halted = self.st.halted_count();
         let mut i = 0;
         let mut pop: Vec<Option<crate::stack::Slice>> = pop.into_iter().map(Some).collect();
         let n = pop.len();
-        let _ = is_fragile;
         while i < n {
             let slice = pop[i].take().unwrap();
             let sv = slice.version - removed;

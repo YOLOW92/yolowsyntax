@@ -66,7 +66,11 @@ fn collect_txt(dir: &Path) -> Vec<PathBuf> {
         let p = ent.path();
         if p.is_dir() {
             files.extend(collect_txt(&p));
-        } else if p.extension().and_then(|s| s.to_str()) == Some("txt") {
+        } else if p.is_file()
+            && p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| matches!(e, "txt" | "test" | "mk" | "scm"))
+        {
             files.push(p);
         }
     }
@@ -74,8 +78,65 @@ fn collect_txt(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn load_cases(corpus_root: &Path, spec: &Spec) -> Vec<(String, Vec<Case>)> {
-    collect_txt(&corpus_root.join(spec.corpus_subpath))
+const ALL_TAGS: &[&str] = &[
+    "c",
+    "cpp",
+    "csharp",
+    "go",
+    "java",
+    "javascript",
+    "typescript",
+    "tsx",
+    "php",
+    "python",
+    "rust",
+    "lua",
+    "bash",
+    "ruby",
+    "kotlin",
+    "css",
+    "html",
+    "objc",
+    "dart",
+    "julia",
+    "nix",
+    "dockerfile",
+    "ocaml",
+    "elixir",
+    "r",
+    "svelte",
+    "solidity",
+    "groovy",
+    "make",
+    "scheme",
+    "commonlisp",
+    "pascal",
+    "gleam",
+    "powershell",
+    "cmake",
+    "erlang",
+    "hcl",
+    "vue",
+    "d",
+    "elm",
+    "verilog",
+];
+
+fn find_corpus_dir(corpus_root: &Path, tag: &str) -> PathBuf {
+    let base = corpus_root.join(tag);
+    let tc = base.join("test/corpus");
+    if tc.is_dir() {
+        return tc;
+    }
+    let c = base.join("corpus");
+    if c.is_dir() {
+        return c;
+    }
+    base
+}
+
+fn load_cases_for_dir(dir: &Path) -> Vec<(String, Vec<Case>)> {
+    collect_txt(dir)
         .into_iter()
         .map(|p| {
             let name = p
@@ -88,6 +149,10 @@ fn load_cases(corpus_root: &Path, spec: &Spec) -> Vec<(String, Vec<Case>)> {
             (name, parse_corpus(&text))
         })
         .collect()
+}
+
+fn load_cases(corpus_root: &Path, spec: &Spec) -> Vec<(String, Vec<Case>)> {
+    load_cases_for_dir(&corpus_root.join(spec.corpus_subpath))
 }
 
 fn run_ts_cases(
@@ -159,15 +224,27 @@ fn cmd_corpus(corpus_root: &Path) {
     }
 }
 
-fn build_payload(corpus_root: &Path, spec: &Spec, target_bytes: usize) -> String {
-    let files = load_cases(corpus_root, spec);
+fn build_payload_from_files(files: &[(String, Vec<Case>)], target_bytes: usize) -> String {
     let mut valid_snips: Vec<String> = Vec::new();
-    for (_, cases) in &files {
+    for (_, cases) in files {
         for c in cases {
             if !c.skip && !c.error && !c.cst && c.platform_ok && c.language.is_none() {
                 if let Ok(s) = std::str::from_utf8(&c.input) {
                     if !s.trim().is_empty() {
                         valid_snips.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if valid_snips.is_empty() {
+        for (_, cases) in files {
+            for c in cases {
+                if !c.skip && !c.error && !c.cst && c.platform_ok {
+                    if let Ok(s) = std::str::from_utf8(&c.input) {
+                        if !s.trim().is_empty() {
+                            valid_snips.push(s.to_string());
+                        }
                     }
                 }
             }
@@ -184,6 +261,11 @@ fn build_payload(corpus_root: &Path, spec: &Spec, target_bytes: usize) -> String
         idx += 1;
     }
     out
+}
+
+fn build_payload(corpus_root: &Path, spec: &Spec, target_bytes: usize) -> String {
+    let files = load_cases(corpus_root, spec);
+    build_payload_from_files(&files, target_bytes)
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -273,18 +355,107 @@ fn vm_hwm_kib() -> Option<usize> {
     None
 }
 
+fn cmd_all_corpus(corpus_root: &Path) {
+    println!("lang\tcases\tyolow_pass\tyolow_pct\tskipped");
+    let (mut tot_cases, mut tot_pass, mut tot_skip) = (0usize, 0usize, 0usize);
+    for &tag in ALL_TAGS {
+        let lang = Lang::from_tag(tag).unwrap().table().unwrap();
+        let dir = find_corpus_dir(corpus_root, tag);
+        let files = load_cases_for_dir(&dir);
+        let mut rep = Report::default();
+        for (fname, cases) in &files {
+            run_cases(lang, fname, cases, &mut rep);
+        }
+        tot_cases += rep.total;
+        tot_pass += rep.passed;
+        tot_skip += rep.skipped;
+        let pct = if rep.total > 0 {
+            100.0 * rep.passed as f64 / rep.total as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{}\t{}\t{}\t{:.2}%\t{}",
+            tag, rep.total, rep.passed, pct, rep.skipped
+        );
+        if !rep.failures.is_empty() {
+            for (name, _, _) in rep.failures.iter().take(3) {
+                eprintln!("  [fail] {tag}: {name}");
+            }
+        }
+    }
+    let tot_pct = if tot_cases > 0 {
+        100.0 * tot_pass as f64 / tot_cases as f64
+    } else {
+        0.0
+    };
+    println!(
+        "TOTAL\t{}\t{}\t{:.2}%\t{}",
+        tot_cases, tot_pass, tot_pct, tot_skip
+    );
+}
+
+fn cmd_all_bench(corpus_root: &Path, target_kb: usize, rounds: usize) {
+    let target_bytes = target_kb * 1024;
+    println!(
+        "lang\tbytes\tcold_load_ms\tyolow_parse_ms\tyolow_outline_ms\tyolow_mb_s"
+    );
+    for &tag in ALL_TAGS {
+        let dir = find_corpus_dir(corpus_root, tag);
+        let files = load_cases_for_dir(&dir);
+        let payload = build_payload_from_files(&files, target_bytes);
+        let bytes = payload.as_bytes();
+        let cold_t0 = Instant::now();
+        let lang = Lang::from_tag(tag).unwrap().table().unwrap();
+        let cold_ms = cold_t0.elapsed().as_secs_f64() * 1e3;
+        if bytes.is_empty() {
+            println!("{}\t0\t{:.3}\t0.000\t0.000\t0.00", tag, cold_ms);
+            continue;
+        }
+        black_box(parse(lang, bytes, Limits::default()));
+        black_box(outline(tag, &payload));
+
+        let mut parse_times = Vec::with_capacity(rounds);
+        let mut outline_times = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let t0 = Instant::now();
+            black_box(parse(lang, bytes, Limits::default()));
+            parse_times.push(t0.elapsed().as_secs_f64() * 1e3);
+
+            let t1 = Instant::now();
+            black_box(outline(tag, &payload));
+            outline_times.push(t1.elapsed().as_secs_f64() * 1e3);
+        }
+        let yp = median(&mut parse_times);
+        let yo = median(&mut outline_times);
+        let mb = bytes.len() as f64 / (1024.0 * 1024.0);
+        let mbs = mb / (yp / 1e3);
+        println!(
+            "{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.2}",
+            tag,
+            bytes.len(),
+            cold_ms,
+            yp,
+            yo,
+            mbs
+        );
+    }
+}
+
 fn cmd_rss(corpus_root: &Path, engine: &str, tag: &str, target_kb: usize) {
-    let spec = SPECS.iter().find(|s| s.tag == tag).expect("unknown lang");
-    let payload = build_payload(corpus_root, spec, target_kb * 1024);
+    let dir = find_corpus_dir(corpus_root, tag);
+    let files = load_cases_for_dir(&dir);
+    let payload = build_payload_from_files(&files, target_kb * 1024);
     let bytes = payload.as_bytes();
     match engine {
         "yolow" => {
-            let lang = Lang::from_tag(spec.tag).unwrap().table().unwrap();
+            let lang = Lang::from_tag(tag).expect("unknown lang").table().unwrap();
             for _ in 0..5 {
                 black_box(parse(lang, bytes, Limits::default()));
             }
         }
         "ts" => {
+            let spec = SPECS.iter().find(|s| s.tag == tag).expect("unknown ts lang");
             let ts_lang = (spec.ts_lang)();
             let mut p = tree_sitter::Parser::new();
             p.set_language(&ts_lang).unwrap();
@@ -303,10 +474,16 @@ fn main() {
     let corpus_root = PathBuf::from(args.next().unwrap_or_else(|| "../corpus".to_string()));
     match cmd.as_str() {
         "corpus" => cmd_corpus(&corpus_root),
+        "all-corpus" => cmd_all_corpus(&corpus_root),
         "bench" => {
             let kb: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(64);
             let rounds: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
             cmd_bench(&corpus_root, kb, rounds);
+        }
+        "all-bench" => {
+            let kb: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(64);
+            let rounds: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
+            cmd_all_bench(&corpus_root, kb, rounds);
         }
         "rss" => {
             let engine = args.next().expect("engine");

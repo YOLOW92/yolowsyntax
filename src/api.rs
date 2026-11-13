@@ -119,7 +119,7 @@ impl ParseTree {
                             && node.child_count == 0
                             && node.size.bytes > 0
                         {
-                            node.lchar
+                            node.lchar()
                         } else {
                             0
                         },

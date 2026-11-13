@@ -1,6 +1,6 @@
 [package]
 name = "yolowsyntax"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Pure-Rust tree-sitter grammar runtime and code outline extractor (symbols, imports, sections) for 41 languages."
@@ -25,7 +25,7 @@ include = [
 tools = []
 
 [dependencies]
-miniz_oxide = "0.9.1"
+yolowzstd = "0.1.2"
 
 [[bin]]
 name = "ts-convert"

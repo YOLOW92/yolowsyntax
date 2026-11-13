@@ -9,8 +9,13 @@ fn main() {
     let name = a.get(3).cloned().unwrap_or_else(|| "unknown".into());
     match yolowsyntax::convert::convert(&text, &name) {
         Ok(l) => {
-            let b = l.to_bytes();
-            std::fs::write(&a[2], &b).expect("写出失败");
+            let raw = l.to_bytes();
+            let out = if a[2].ends_with(".z") {
+                yolowzstd::compress_with(&raw, &yolowzstd::CompressOptions::new(19))
+            } else {
+                raw.clone()
+            };
+            std::fs::write(&a[2], &out).expect("写出失败");
             println!(
                 "{}: 状态 {} 符号 {} 动作 {} 词法段 {}+{} -> {} 字节",
                 l.name,
@@ -19,7 +24,7 @@ fn main() {
                 l.actions.len(),
                 l.lex.segs.len(),
                 l.keyword_lex.segs.len(),
-                b.len()
+                out.len()
             );
         }
         Err(e) => {

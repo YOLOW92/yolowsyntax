@@ -112,13 +112,51 @@ impl<'a> Lexer<'a> {
 
     /// 执行一个词法函数，成功返回 true，结果符号在 `self.result`。
     pub fn run(&mut self, t: &LexTable, mut state: u16) -> bool {
-        if t.starts.is_empty() || state as usize >= t.state_count() {
+        let sc = t.state_count();
+        if t.starts.is_empty() || state as usize >= sc {
             return false;
         }
+        let input = self.input;
+        let len = input.len();
         let mut found = false;
         // 在输入末尾“前进”不会移动位置；词法表若在末尾处成环就永远不会停，所以限制连续次数
         let mut stuck = 0u32;
         loop {
+            let i = self.pos.bytes as usize;
+            if i < len {
+                let b = input[i];
+                if b < 0x80 {
+                    let seg = t.find_ascii(state, b);
+                    if seg.accept != NO_SYM {
+                        found = true;
+                        self.result = seg.accept;
+                        self.token_end = Some(self.pos);
+                    }
+                    match seg.kind() {
+                        1 => {
+                            self.pos.bytes = (i + 1) as u32;
+                            if b == b'\n' {
+                                self.pos.rows += 1;
+                            }
+                        }
+                        2 => {
+                            self.pos.bytes = (i + 1) as u32;
+                            if b == b'\n' {
+                                self.pos.rows += 1;
+                            }
+                            self.token_start = self.pos;
+                        }
+                        _ => return found,
+                    }
+                    stuck = 0;
+                    let tgt = seg.target();
+                    if tgt as usize >= sc {
+                        return found;
+                    }
+                    state = tgt;
+                    continue;
+                }
+            }
             let seg = t.find(state, self.look());
             if seg.accept != NO_SYM {
                 found = true;
@@ -126,7 +164,7 @@ impl<'a> Lexer<'a> {
                 self.mark_end();
             }
             let before = self.pos.bytes;
-            match seg.kind {
+            match seg.kind() {
                 1 => self.advance(false),
                 2 => self.advance(true),
                 _ => return found,
@@ -139,10 +177,11 @@ impl<'a> Lexer<'a> {
             } else {
                 stuck = 0;
             }
-            if seg.target as usize >= t.state_count() {
+            let tgt = seg.target();
+            if tgt as usize >= sc {
                 return found;
             }
-            state = seg.target;
+            state = tgt;
         }
     }
 }

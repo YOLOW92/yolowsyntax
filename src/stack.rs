@@ -14,10 +14,14 @@ pub struct Link {
     pub pending: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct SNode {
     pub state: u16,
+    pub link_len: u8,
     pub pos: Len,
-    pub links: Vec<Link>,
+    pub first: Link,
+    /// `link_len >= 2` 时指向 `Stack::extra_links` 下标，否则为 NONE。
+    pub extra_links: u32,
     pub error_cost: u32,
     pub node_count: u32,
     pub dprec: i32,
@@ -63,8 +67,12 @@ struct Iter {
 
 pub struct Stack {
     pub nodes: Vec<SNode>,
+    pub extra_links: Vec<[Link; MAX_LINK_COUNT - 1]>,
     pub heads: Vec<Head>,
     base: u32,
+    pub(crate) scratch_nodes: Vec<SNode>,
+    pub(crate) scratch_extra: Vec<[Link; MAX_LINK_COUNT - 1]>,
+    pub(crate) scratch_smap: Vec<u32>,
 }
 
 fn subtree_node_count(a: &Arena, t: u32) -> u32 {
@@ -99,17 +107,29 @@ fn equivalent(a: &Arena, l: u32, r: u32) -> bool {
         && ln.extra() == rn.extra()
 }
 
+const EMPTY_LINK: Link = Link {
+    node: 0,
+    tree: NONE,
+    pending: false,
+};
+
 impl Stack {
     pub fn new() -> Stack {
         let mut s = Stack {
             nodes: Vec::new(),
+            extra_links: Vec::new(),
             heads: Vec::new(),
             base: 0,
+            scratch_nodes: Vec::new(),
+            scratch_extra: Vec::new(),
+            scratch_smap: Vec::new(),
         };
         s.nodes.push(SNode {
             state: 1,
+            link_len: 0,
             pos: Len::default(),
-            links: Vec::new(),
+            first: EMPTY_LINK,
+            extra_links: NONE,
             error_cost: 0,
             node_count: 0,
             dprec: 0,
@@ -117,6 +137,69 @@ impl Stack {
         });
         s.clear();
         s
+    }
+
+    #[inline]
+    pub fn link_count(&self, node: u32) -> usize {
+        self.nodes[node as usize].link_len as usize
+    }
+
+    #[inline]
+    pub fn link_at(&self, node: u32, idx: usize) -> Link {
+        let n = &self.nodes[node as usize];
+        if idx == 0 {
+            n.first
+        } else {
+            self.extra_links[n.extra_links as usize][idx - 1]
+        }
+    }
+
+    #[inline]
+    fn set_link(&mut self, node: u32, idx: usize, link: Link) {
+        let n = &mut self.nodes[node as usize];
+        if idx == 0 {
+            n.first = link;
+        } else {
+            self.extra_links[n.extra_links as usize][idx - 1] = link;
+        }
+    }
+
+    #[inline]
+    fn push_node_link(&mut self, node: u32, link: Link) {
+        let len = self.nodes[node as usize].link_len as usize;
+        if len == 0 {
+            let n = &mut self.nodes[node as usize];
+            n.first = link;
+            n.link_len = 1;
+        } else if len < MAX_LINK_COUNT {
+            if len == 1 {
+                let slot = self.extra_links.len() as u32;
+                self.extra_links.push([EMPTY_LINK; MAX_LINK_COUNT - 1]);
+                self.extra_links[slot as usize][0] = link;
+                let n = &mut self.nodes[node as usize];
+                n.extra_links = slot;
+                n.link_len = 2;
+            } else {
+                let slot = self.nodes[node as usize].extra_links as usize;
+                self.extra_links[slot][len - 1] = link;
+                self.nodes[node as usize].link_len = (len + 1) as u8;
+            }
+        }
+    }
+
+    #[inline]
+    fn copy_links(&self, node: u32) -> ([Link; MAX_LINK_COUNT], usize) {
+        let n = &self.nodes[node as usize];
+        let len = n.link_len as usize;
+        let mut out = [EMPTY_LINK; MAX_LINK_COUNT];
+        if len > 0 {
+            out[0] = n.first;
+            if len > 1 {
+                let ex = &self.extra_links[n.extra_links as usize];
+                out[1..len].copy_from_slice(&ex[..len - 1]);
+            }
+        }
+        (out, len)
     }
 
     pub fn clear(&mut self) {
@@ -167,7 +250,7 @@ impl Stack {
         let n = &self.nodes[h.node as usize];
         let mut r = n.error_cost;
         if h.status == Status::Paused
-            || (n.state == ERROR_STATE && n.links.first().is_some_and(|l| l.tree == NONE))
+            || (n.state == ERROR_STATE && n.link_len > 0 && n.first.tree == NONE)
         {
             r += crate::tree::ERROR_COST_PER_RECOVERY;
         }
@@ -188,12 +271,14 @@ impl Stack {
         let p = &self.nodes[prev as usize];
         let mut n = SNode {
             state,
+            link_len: 1,
             pos: p.pos,
-            links: vec![Link {
+            first: Link {
                 node: prev,
                 tree,
                 pending,
-            }],
+            },
+            extra_links: NONE,
             error_cost: p.error_cost,
             node_count: p.node_count,
             dprec: p.dprec,
@@ -226,15 +311,16 @@ impl Stack {
                 continue;
             }
             let mut handled = false;
-            for i in 0..self.nodes[me as usize].links.len() {
-                let ex = self.nodes[me as usize].links[i];
+            let lcnt = self.link_count(me);
+            for i in 0..lcnt {
+                let ex = self.link_at(me, i);
                 if equivalent(a, ex.tree, link.tree) {
                     if ex.node == link.node {
                         if link.tree != NONE
                             && ex.tree != NONE
                             && a.n(link.tree).dprec > a.n(ex.tree).dprec
                         {
-                            self.nodes[me as usize].links[i].tree = link.tree;
+                            self.set_link(me, i, link);
                             let d = self.nodes[link.node as usize].dprec + a.n(link.tree).dprec;
                             self.nodes[me as usize].dprec = d;
                         }
@@ -249,13 +335,13 @@ impl Stack {
                         && en.pos.bytes == ln.pos.bytes
                         && en.error_cost == ln.error_cost
                     {
-                        let sub: Vec<Link> = ln.links.clone();
                         let mut dp = ln.dprec;
+                        let (sub, slen) = self.copy_links(link.node);
                         if link.tree != NONE {
                             dp += a.n(link.tree).dprec;
                         }
-                        for l in sub {
-                            work.push((ex.node, l));
+                        for l in &sub[..slen] {
+                            work.push((ex.node, *l));
                         }
                         if dp > self.nodes[me as usize].dprec {
                             self.nodes[me as usize].dprec = dp;
@@ -265,7 +351,7 @@ impl Stack {
                     }
                 }
             }
-            if handled || self.nodes[me as usize].links.len() == MAX_LINK_COUNT {
+            if handled || self.link_count(me) == MAX_LINK_COUNT {
                 continue;
             }
             let mut nc = self.nodes[link.node as usize].node_count;
@@ -274,8 +360,8 @@ impl Stack {
                 nc += subtree_node_count(a, link.tree);
                 dp += a.n(link.tree).dprec;
             }
+            self.push_node_link(me, link);
             let m = &mut self.nodes[me as usize];
-            m.links.push(link);
             if nc > m.node_count {
                 m.node_count = nc;
             }
@@ -301,8 +387,8 @@ impl Stack {
             return false;
         }
         let (n1, n2) = (self.heads[v1].node, self.heads[v2].node);
-        let links = self.nodes[n2 as usize].links.clone();
-        for l in links {
+        let (links, len) = self.copy_links(n2);
+        for &l in &links[..len] {
             self.add_link(a, n1, l);
         }
         if self.nodes[n1 as usize].state == ERROR_STATE {
@@ -360,9 +446,8 @@ impl Stack {
         }
         loop {
             let n = &self.nodes[node as usize];
-            if let Some(l) = n.links.first()
-                && l.tree != NONE
-            {
+            if n.link_len > 0 && n.first.tree != NONE {
+                let l = n.first;
                 let t = a.n(l.tree);
                 if t.total().bytes > 0 {
                     return true;
@@ -397,7 +482,7 @@ impl Stack {
             while i < size {
                 let node_id = its[i].node;
                 let (pop, stop0) = cb(&its[i], &self.nodes[node_id as usize]);
-                let link_count = self.nodes[node_id as usize].links.len();
+                let link_count = self.link_count(node_id);
                 let stop = stop0 || link_count == 0;
                 if pop {
                     let mut trees = if stop {
@@ -416,13 +501,13 @@ impl Stack {
                 for j in 1..=link_count {
                     let (link, idx);
                     if j == link_count {
-                        link = self.nodes[node_id as usize].links[0];
+                        link = self.link_at(node_id, 0);
                         idx = i;
                     } else {
                         if its.len() >= MAX_ITERATOR_COUNT {
                             continue;
                         }
-                        link = self.nodes[node_id as usize].links[j];
+                        link = self.link_at(node_id, j);
                         let c = Iter {
                             node: its[i].node,
                             trees: its[i].trees.clone(),
@@ -479,6 +564,46 @@ impl Stack {
         });
     }
 
+    /// 无分叉单链快路径：沿唯一前驱走 `count` 步并将子树逆序写入可复用 `trees`，遇到分叉返回 `None`。
+    pub fn pop_count_fast(
+        &mut self,
+        a: &Arena,
+        v: usize,
+        count: u32,
+        trees: &mut Vec<u32>,
+    ) -> Option<usize> {
+        trees.clear();
+        let mut node_id = self.heads[v].node;
+        let mut c = 0u32;
+        while c < count {
+            let n = &self.nodes[node_id as usize];
+            if n.link_len != 1 {
+                return None;
+            }
+            let l = n.first;
+            node_id = l.node;
+            if l.tree != NONE {
+                trees.push(l.tree);
+                if !a.n(l.tree).extra() {
+                    c += 1;
+                }
+            } else {
+                c += 1;
+            }
+        }
+        trees.reverse();
+        let o = &self.heads[v];
+        self.heads.push(Head {
+            node: node_id,
+            status: Status::Active,
+            node_count_at_last_error: o.node_count_at_last_error,
+            summary: None,
+            paused_lookahead: NONE,
+            ext: o.ext,
+        });
+        Some(self.heads.len() - 1)
+    }
+
     pub fn pop_count(&mut self, a: &Arena, v: usize, count: u32) -> Vec<Slice> {
         self.iter(a, v, count as i32, |it, _| {
             if it.count == count {
@@ -490,15 +615,20 @@ impl Stack {
     }
 
     pub fn pop_all(&mut self, a: &Arena, v: usize) -> Vec<Slice> {
-        self.iter(a, v, 0, |_, n| (n.links.is_empty(), false))
+        self.iter(a, v, 0, |_, n| (n.link_len == 0, false))
     }
 
     pub fn pop_error(&mut self, a: &Arena, v: usize) -> Vec<u32> {
         let node = self.heads[v].node;
-        let has = self.nodes[node as usize]
-            .links
-            .iter()
-            .any(|l| l.tree != NONE && a.n(l.tree).is_error());
+        let lcnt = self.link_count(node);
+        let mut has = false;
+        for i in 0..lcnt {
+            let l = self.link_at(node, i);
+            if l.tree != NONE && a.n(l.tree).is_error() {
+                has = true;
+                break;
+            }
+        }
         if !has {
             return Vec::new();
         }

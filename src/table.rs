@@ -23,26 +23,120 @@ pub enum Action {
 }
 
 /// 词法状态机里一段连续码点的行为（码点域 0..=0x110000，0x110000 表示输入结束）。
+/// 紧凑 8 字节布局：`packed` 低 14 位存目标状态，高 2 位存动作类型（0 结束，1 前进，2 跳过）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seg {
     pub lo: u32,
     /// 走到这一段之前已经执行过的 ACCEPT_TOKEN 符号，`NO_SYM` 表示没有。
     pub accept: u16,
-    /// 0 结束状态，1 前进（ADVANCE），2 跳过（SKIP）。
-    pub kind: u8,
-    pub target: u16,
+    pub packed: u16,
+}
+
+impl Seg {
+    #[inline]
+    pub const fn new(lo: u32, accept: u16, kind: u8, target: u16) -> Self {
+        Self {
+            lo,
+            accept,
+            packed: ((kind as u16) << 14) | (target & 0x3FFF),
+        }
+    }
+    #[inline]
+    pub const fn kind(self) -> u8 {
+        (self.packed >> 14) as u8
+    }
+    #[inline]
+    pub const fn target(self) -> u16 {
+        self.packed & 0x3FFF
+    }
 }
 
 pub const NO_SYM: u16 = 0xFFFF;
 pub const EOF_CP: u32 = 0x110000;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LexAscii(Vec<u8>);
+
+impl PartialEq for LexAscii {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for LexAscii {}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DenseTable {
+    states: usize,
+    stride: usize,
+    data: Vec<u16>,
+}
+
+impl PartialEq for DenseTable {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for DenseTable {}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LexTable {
     pub starts: Vec<u32>,
     pub segs: Vec<Seg>,
+    pub(crate) ascii: LexAscii,
 }
 
 impl LexTable {
+    /// 预先为 ASCII 码点（0..128）构造每状态 128 字节直查索引。
+    pub(crate) fn build_accel(&mut self) {
+        let sc = self.state_count();
+        self.ascii.0.clear();
+        if sc == 0 {
+            return;
+        }
+        self.ascii.0.resize(sc * 128, 255);
+        for s in 0..sc {
+            let a = self.starts[s] as usize;
+            let b = self.starts[s + 1] as usize;
+            if a >= b {
+                continue;
+            }
+            let row = &mut self.ascii.0[s * 128..(s + 1) * 128];
+            let mut pos = 0usize;
+            let mut last_k = 0usize;
+            for k in 0..(b - a) {
+                let lo = self.segs[a + k].lo as usize;
+                let end = lo.min(128);
+                if end > pos && k > 0 {
+                    let v = if last_k < 255 { last_k as u8 } else { 255 };
+                    row[pos..end].fill(v);
+                    pos = end;
+                } else if k == 0 && end > 0 {
+                    pos = end;
+                }
+                if lo >= 128 {
+                    break;
+                }
+                last_k = k;
+            }
+            if pos < 128 {
+                let v = if last_k < 255 { last_k as u8 } else { 255 };
+                row[pos..128].fill(v);
+            }
+        }
+    }
+
+    /// O(1) 查 ASCII 字节对应词法段（仅在 `byte < 128` 且 `state < state_count()` 时使用）。
+    #[inline]
+    pub(crate) fn find_ascii(&self, state: u16, byte: u8) -> Seg {
+        let st = state as usize;
+        let idx = self.ascii.0.get(st * 128 + byte as usize).copied().unwrap_or(255);
+        if idx < 255 {
+            self.segs[self.starts[st] as usize + idx as usize]
+        } else {
+            self.find(state, byte as u32)
+        }
+    }
+
     /// 在某个词法状态里按码点查段。
     pub fn find(&self, state: u16, cp: u32) -> Seg {
         let (a, b) = (
@@ -51,12 +145,7 @@ impl LexTable {
         );
         let s = &self.segs[a..b];
         if s.is_empty() {
-            return Seg {
-                lo: 0,
-                accept: NO_SYM,
-                kind: 0,
-                target: 0,
-            };
+            return Seg::new(0, NO_SYM, 0, 0);
         }
         let i = s.partition_point(|x| x.lo <= cp);
         s[i.saturating_sub(1)]
@@ -111,6 +200,7 @@ pub struct Language {
     pub ext_symbol_map: Vec<u16>,
     /// 外部词法状态的有效记号表：按  一行展平，第 0 行全假（行宽为外部记号数）。
     pub ext_valid: Vec<bool>,
+    pub(crate) dense: DenseTable,
 }
 
 pub const SYM_END: u16 = 0;
@@ -118,14 +208,64 @@ pub const SYM_ERROR: u16 = 0xFFFF;
 pub const SYM_ERROR_REPEAT: u16 = 0xFFFE;
 
 impl Language {
+    /// 构建热状态 O(1) 扁平查找表与词法 ASCII 索引（内存上限 1 MiB）。
+    pub(crate) fn build_accel(&mut self) {
+        self.lex.build_accel();
+        self.keyword_lex.build_accel();
+        let stride = (self.symbol_count + self.alias_count) as usize;
+        let cap_states = (512 * 1024) / stride.max(1);
+        let dense_states = (self.large_state_count as usize)
+            .min(self.state_count as usize)
+            .min(cap_states);
+        if dense_states == 0 || stride == 0 {
+            self.dense = DenseTable::default();
+            return;
+        }
+        let mut data = vec![0u16; dense_states * stride];
+        for s in 0..dense_states {
+            let (a, b) = (self.state_start[s] as usize, self.state_start[s + 1] as usize);
+            let row = &mut data[s * stride..(s + 1) * stride];
+            for &x in &self.entries[a..b] {
+                let sym = (x >> 16) as usize;
+                if sym < stride {
+                    row[sym] = (x & 0xFFFF) as u16;
+                }
+            }
+        }
+        self.dense = DenseTable {
+            states: dense_states,
+            stride,
+            data,
+        };
+    }
+
     /// 对应官方 `ts_language_lookup`：终结符得到动作下标，非终结符得到后继状态。
     #[inline]
     pub fn lookup(&self, state: u16, symbol: u16) -> u16 {
+        let st = state as usize;
+        if st < self.dense.states {
+            let sym = symbol as usize;
+            return if sym < self.dense.stride {
+                self.dense.data[st * self.dense.stride + sym]
+            } else {
+                0
+            };
+        }
         let (a, b) = (
-            self.state_start[state as usize] as usize,
-            self.state_start[state as usize + 1] as usize,
+            self.state_start[st] as usize,
+            self.state_start[st + 1] as usize,
         );
         let e = &self.entries[a..b];
+        if e.len() <= 16 {
+            let sym = symbol as u32;
+            for &x in e {
+                let s = x >> 16;
+                if s >= sym {
+                    return if s == sym { (x & 0xFFFF) as u16 } else { 0 };
+                }
+            }
+            return 0;
+        }
         let i = e.partition_point(|x| (x >> 16) < symbol as u32);
         if i < e.len() && (e[i] >> 16) == symbol as u32 {
             (e[i] & 0xFFFF) as u16
@@ -137,13 +277,9 @@ impl Language {
     pub fn has_actions(&self, state: u16, symbol: u16) -> bool {
         self.lookup(state, symbol) != 0
     }
-    /// 官方 `ts_language_table_entry`：错误符号没有动作。
     #[inline]
-    pub fn actions_for(&self, state: u16, symbol: u16) -> &[Action] {
-        if symbol == SYM_ERROR || symbol == SYM_ERROR_REPEAT {
-            return &[];
-        }
-        let idx = self.lookup(state, symbol) as usize;
+    pub(crate) fn actions_at(&self, idx: u16) -> &[Action] {
+        let idx = idx as usize;
         if idx == 0 {
             return &[];
         }
@@ -151,6 +287,36 @@ impl Language {
             Some(Action::Header(n)) => &self.actions[idx + 1..idx + 1 + *n as usize],
             _ => &[],
         }
+    }
+    /// 遍历某解析状态下所有非 EOF 终结符的动作切片（兼容稠密直查表与稀疏 `entries`）。
+    pub(crate) fn for_each_token_actions(&self, state: u16, mut f: impl FnMut(&[Action])) {
+        let st = state as usize;
+        if st < self.dense.states {
+            let row = &self.dense.data[st * self.dense.stride..];
+            let tc = (self.token_count as usize).min(self.dense.stride);
+            for &idx in &row[1..tc] {
+                if idx != 0 {
+                    f(self.actions_at(idx));
+                }
+            }
+            return;
+        }
+        let (s, e) = (self.state_start[st] as usize, self.state_start[st + 1] as usize);
+        for &ent in &self.entries[s..e] {
+            let sym = (ent >> 16) as u16;
+            if sym == 0 || sym as u32 >= self.token_count {
+                continue;
+            }
+            f(self.actions_at((ent & 0xFFFF) as u16));
+        }
+    }
+    /// 官方 `ts_language_table_entry`：错误符号没有动作。
+    #[inline]
+    pub fn actions_for(&self, state: u16, symbol: u16) -> &[Action] {
+        if symbol == SYM_ERROR || symbol == SYM_ERROR_REPEAT {
+            return &[];
+        }
+        self.actions_at(self.lookup(state, symbol))
     }
     pub fn has_reduce_action(&self, state: u16, symbol: u16) -> bool {
         matches!(
@@ -323,8 +489,8 @@ impl Language {
             for s in &t.segs {
                 w.u32(s.lo);
                 w.u16(s.accept);
-                w.u16(s.target);
-                w.0.push(s.kind);
+                w.u16(s.target());
+                w.0.push(s.kind());
             }
         }
         // 外部扫描器相关的尾部分段（旧表没有）
@@ -332,6 +498,24 @@ impl Language {
         w.u16s(&self.ext_symbol_map);
         w.bytes(&self.ext_valid.iter().map(|b| *b as u8).collect::<Vec<_>>());
         w.0
+    }
+
+    /// 运行时专用加载：构造好稠密直查表后裁掉被覆盖的 `entries` 前缀以压缩常驻内存。
+    pub(crate) fn from_bytes_runtime(b: &[u8]) -> Result<Language, String> {
+        let mut l = Self::from_bytes(b)?;
+        let ds = l.dense.states;
+        if ds > 0 && ds <= l.state_count as usize {
+            let drop_idx = l.state_start[ds] as usize;
+            if drop_idx > 0 && drop_idx <= l.entries.len() {
+                l.entries = l.entries[drop_idx..].to_vec();
+                let d = drop_idx as u32;
+                for x in &mut l.state_start[ds..] {
+                    *x -= d;
+                }
+                l.state_start[..ds].fill(0);
+            }
+        }
+        Ok(l)
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Language, String> {
@@ -360,15 +544,20 @@ impl Language {
         l.symbol_metadata = r.bytes()?;
         l.field_names = r.strs()?;
         let n = r.u32()? as usize;
-        for _ in 0..n {
-            l.field_map_slices.push((r.u16()?, r.u16()?));
+        let bytes = r.take(n.checked_mul(4).ok_or("长度溢出")?)?;
+        l.field_map_slices.reserve(n);
+        for c in bytes.as_chunks::<4>().0 {
+            l.field_map_slices.push((
+                u16::from_le_bytes([c[0], c[1]]),
+                u16::from_le_bytes([c[2], c[3]]),
+            ));
         }
         let n = r.u32()? as usize;
-        for _ in 0..n {
-            let f = r.u16()?;
-            let i = r.u8()?;
-            let inh = r.u8()? != 0;
-            l.field_map_entries.push((f, i, inh));
+        let bytes = r.take(n.checked_mul(4).ok_or("长度溢出")?)?;
+        l.field_map_entries.reserve(n);
+        for c in bytes.as_chunks::<4>().0 {
+            l.field_map_entries
+                .push((u16::from_le_bytes([c[0], c[1]]), c[2], c[3] != 0));
         }
         l.alias_sequences = r.u16s()?;
         l.non_terminal_alias_map = r.u16s()?;
@@ -380,22 +569,27 @@ impl Language {
         l.state_start = r.u32s()?;
         l.entries = r.u32s()?;
         let n = r.u32()? as usize;
-        for _ in 0..n {
-            let t = r.u8()?;
-            let f = r.u8()?;
-            let p = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+        let bytes = r.take(n.checked_mul(10).ok_or("长度溢出")?)?;
+        l.actions.reserve(n);
+        for c in bytes.as_chunks::<10>().0 {
+            let t = c[0];
+            let f = c[1];
+            let p0 = u16::from_le_bytes([c[2], c[3]]);
+            let p1 = u16::from_le_bytes([c[4], c[5]]);
+            let p2 = u16::from_le_bytes([c[6], c[7]]);
+            let p3 = u16::from_le_bytes([c[8], c[9]]);
             l.actions.push(match t {
-                0 => Action::Header(p[0]),
+                0 => Action::Header(p0),
                 1 => Action::Shift {
-                    state: p[0],
+                    state: p0,
                     extra: f & 1 != 0,
                     repetition: f & 2 != 0,
                 },
                 2 => Action::Reduce {
-                    symbol: p[0],
-                    count: p[1],
-                    dprec: p[2] as i16,
-                    prod: p[3],
+                    symbol: p0,
+                    count: p1,
+                    dprec: p2 as i16,
+                    prod: p3,
                 },
                 3 => Action::Accept,
                 4 => Action::Recover,
@@ -405,16 +599,23 @@ impl Language {
         for k in 0..2 {
             let starts = r.u32s()?;
             let n = r.u32()? as usize;
-            let mut segs = Vec::with_capacity(n.min(1 << 24));
-            for _ in 0..n {
-                segs.push(Seg {
-                    lo: r.u32()?,
-                    accept: r.u16()?,
-                    target: r.u16()?,
-                    kind: r.u8()?,
-                });
+            let bytes = r.take(n.checked_mul(9).ok_or("长度溢出")?)?;
+            let mut segs = Vec::with_capacity(n);
+            for c in bytes.as_chunks::<9>().0 {
+                let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let accept = u16::from_le_bytes([c[4], c[5]]);
+                let target = u16::from_le_bytes([c[6], c[7]]);
+                let kind = c[8];
+                if target > 0x3FFF || kind > 2 {
+                    return Err("词法段越界".into());
+                }
+                segs.push(Seg::new(lo, accept, kind, target));
             }
-            let t = LexTable { starts, segs };
+            let t = LexTable {
+                starts,
+                segs,
+                ascii: LexAscii::default(),
+            };
             if k == 0 { l.lex = t } else { l.keyword_lex = t }
         }
         if r.p < b.len() {
@@ -423,6 +624,7 @@ impl Language {
             l.ext_valid = r.bytes()?.into_iter().map(|x| x != 0).collect();
         }
         l.validate()?;
+        l.build_accel();
         Ok(l)
     }
 
@@ -531,13 +733,6 @@ impl R<'_> {
         let s = &self.b[self.p..e];
         self.p = e;
         Ok(s)
-    }
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
     }
     fn u32(&mut self) -> Result<u32, String> {
         let s = self.take(4)?;

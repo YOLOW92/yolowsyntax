@@ -165,19 +165,11 @@ impl Parser<'_> {
                 has_shift =
                     Self::process_candidates(lang.actions_for(state, lookahead_symbol), &mut reds);
             } else {
-                let (s, e) = (
-                    lang.state_start[state as usize] as usize,
-                    lang.state_start[state as usize + 1] as usize,
-                );
-                for &ent in &lang.entries[s..e] {
-                    let sym = (ent >> 16) as u16;
-                    if sym == 0 || sym as u32 >= lang.token_count {
-                        continue;
-                    }
-                    if Self::process_candidates(lang.actions_for(state, sym), &mut reds) {
+                lang.for_each_token_actions(state, |acts| {
+                    if Self::process_candidates(acts, &mut reds) {
                         has_shift = true;
                     }
-                }
+                });
                 // 稳定的降序插入排序
                 for j in 1..reds.len() {
                     let mut k = j;
